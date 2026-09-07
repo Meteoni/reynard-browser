@@ -1,0 +1,41 @@
+diff --git a/widget/uikit/GeckoEditableSupport.mm b/widget/uikit/GeckoEditableSupport.mm
+--- a/widget/uikit/GeckoEditableSupport.mm
++++ b/widget/uikit/GeckoEditableSupport.mm
+@@ -1765,7 +1765,7 @@
+                                handler:handler];
+     }
+   }
+ 
+-  NSUInteger candidateOffset = 0;
++  NSUInteger candidateOffset = NSNotFound;
+   if (selectedRange.location != NSNotFound &&
+       mEditable.mActiveSelectionHandle != GeckoSelectionHandleNone &&
+       mEditable.mSelectionHandleAnchorOffset != NSNotFound) {
+@@ -1945,7 +1945,24 @@
+     NSUInteger upper = std::max(candidateOffset, anchor);
+     mEditable.mShadowSelectedRange = NSMakeRange(lower, upper - lower);
+   }
+ 
++  // UIKit also calls closestPositionToPoint: for cursor movement that does not
++  // involve an on-page selection handle, including the keyboard trackpad. Ask
++  // Gecko for the caret position corresponding to the point instead of falling
++  // through to document offset 0.
++  if (candidateOffset == NSNotFound) {
++    LayoutDeviceIntPoint point =
++        UIKitPointsToDevPixels(aPoint, [self contentScaleFactor]);
++    WidgetQueryContentEvent query(true, eQueryCharacterAtPoint, mGeckoChild);
++    query.mRefPoint = point;
++    mGeckoChild->DispatchWindowEvent(query);
++
++    if (query.FoundTentativeCaretOffset()) {
++      candidateOffset =
++          [self clampOffset:query.mReply->mTentativeCaretOffset.value()];
++    } else if (selectedRange.location != NSNotFound) {
++      candidateOffset = [self clampOffset:selectedRange.location];
++    } else {
++      candidateOffset = [self documentLength];
++    }
++  }
++
+   return [ChildViewTextPosition positionWithOffset:candidateOffset];
+ }
