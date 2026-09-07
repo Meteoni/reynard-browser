@@ -11,7 +11,7 @@ diff --git a/widget/uikit/GeckoEditableSupport.mm b/widget/uikit/GeckoEditableSu
    if (selectedRange.location != NSNotFound &&
        mEditable.mActiveSelectionHandle != GeckoSelectionHandleNone &&
        mEditable.mSelectionHandleAnchorOffset != NSNotFound) {
-@@ -1945,7 +1945,28 @@
+@@ -1945,6 +1945,27 @@
      NSUInteger upper = std::max(candidateOffset, anchor);
      mEditable.mShadowSelectedRange = NSMakeRange(lower, upper - lower);
    }
