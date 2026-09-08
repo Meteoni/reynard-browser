@@ -1,7 +1,33 @@
+diff --git a/widget/uikit/GeckoEditableSupport.h b/widget/uikit/GeckoEditableSupport.h
+--- a/widget/uikit/GeckoEditableSupport.h
++++ b/widget/uikit/GeckoEditableSupport.h
+@@ -72,6 +72,10 @@ struct GeckoEditableState {
+   BOOL mSelectionHandlesVisibleForTouchInput;
+   id mSelectionHandleSuppressionAssertion;
+   BOOL mPendingSelectionGeometryRefresh;
++  BOOL mFloatingCursorActive;
++  CGPoint mFloatingCursorStartPoint;
++  CGPoint mFloatingCursorStartCaretPoint;
++  NSUInteger mFloatingCursorLastOffset;
+   BOOL mCaretMenuActive;
+   BOOL mPendingCaretMenu;
+   NSUInteger mPreTapCaretOffset;
 diff --git a/widget/uikit/GeckoEditableSupport.mm b/widget/uikit/GeckoEditableSupport.mm
 --- a/widget/uikit/GeckoEditableSupport.mm
 +++ b/widget/uikit/GeckoEditableSupport.mm
-@@ -1765,8 +1765,8 @@
+@@ -612,7 +612,11 @@
+   mEditable.mTextInteractionInProgress = NO;
+   mEditable.mSelectionHandlesVisibleForTouchInput = NO;
+   mEditable.mSelectionHandleSuppressionAssertion = nil;
+   mEditable.mPendingSelectionGeometryRefresh = NO;
++  mEditable.mFloatingCursorActive = NO;
++  mEditable.mFloatingCursorStartPoint = CGPointZero;
++  mEditable.mFloatingCursorStartCaretPoint = CGPointZero;
++  mEditable.mFloatingCursorLastOffset = NSNotFound;
+   // The other Vietnamese fields are meaningful only while this buffer exists.
+   mEditable.mVietnameseBufferText = nil;
+   mEditable.mKoreanComposedText = nil;
+@@ -1765,8 +1769,8 @@
                                 handler:handler];
      }
    }
@@ -11,15 +37,22 @@ diff --git a/widget/uikit/GeckoEditableSupport.mm b/widget/uikit/GeckoEditableSu
    if (selectedRange.location != NSNotFound &&
        mEditable.mActiveSelectionHandle != GeckoSelectionHandleNone &&
        mEditable.mSelectionHandleAnchorOffset != NSNotFound) {
-@@ -1945,6 +1945,27 @@
+@@ -1945,7 +1949,35 @@
      NSUInteger upper = std::max(candidateOffset, anchor);
      mEditable.mShadowSelectedRange = NSMakeRange(lower, upper - lower);
    }
  
-+  // UIKit also calls closestPositionToPoint: for cursor movement that does not
-+  // involve an on-page selection handle, including the keyboard trackpad. Ask
-+  // Gecko for the caret position corresponding to the point instead of falling
-+  // through to document offset 0.
++  // While the system keyboard's floating cursor is active, the absolute point
++  // supplied by its gesture is not a normal page-local touch coordinate. The
++  // floating-cursor callbacks below translate its movement relative to the
++  // actual Gecko caret instead, so don't let fallback hit testing overwrite it.
++  if (candidateOffset == NSNotFound && mEditable.mFloatingCursorActive &&
++      mEditable.mFloatingCursorLastOffset != NSNotFound) {
++    candidateOffset = [self clampOffset:mEditable.mFloatingCursorLastOffset];
++  }
++
++  // Normal UIKit text interactions still use absolute page-local hit testing.
++  // This path is retained for taps and other on-page interactions.
 +  if (candidateOffset == NSNotFound) {
 +    LayoutDeviceIntPoint point =
 +        UIKitPointsToDevPixels(aPoint, [self contentScaleFactor]);
@@ -39,3 +72,114 @@ diff --git a/widget/uikit/GeckoEditableSupport.mm b/widget/uikit/GeckoEditableSu
 +
    return [ChildViewTextPosition positionWithOffset:candidateOffset];
  }
+ 
+@@ -2392,7 +2424,87 @@
+ - (UIView*)textInputView {
+   return self;
+ }
+ 
++// The system keyboard owns the gesture recognizer for the spacebar trackpad.
++// Its floating-cursor points are useful as a movement vector, but treating the
++// absolute point as a ChildView hit-test coordinate collapses the caret near
++// the beginning of the editable. Anchor the vector to Gecko's real caret.
++- (void)beginFloatingCursorAtPoint:(CGPoint)aPoint {
++  widget::TextInputHandler* handler = [self textHandler];
++  NSRange selectedRange = [self selectedRange];
++  if (!handler || selectedRange.location == NSNotFound) {
++    mEditable.mFloatingCursorActive = NO;
++    mEditable.mFloatingCursorLastOffset = NSNotFound;
++    return;
++  }
++
++  NSUInteger caretOffset = [self clampOffset:selectedRange.location];
++  CGRect caretRect = CGRectZero;
++  if (![self caretRect:&caretRect atOffset:caretOffset handler:handler]) {
++    mEditable.mFloatingCursorActive = NO;
++    mEditable.mFloatingCursorLastOffset = NSNotFound;
++    return;
++  }
++
++  mEditable.mFloatingCursorActive = YES;
++  mEditable.mFloatingCursorStartPoint = aPoint;
++  mEditable.mFloatingCursorStartCaretPoint =
++      CGPointMake(CGRectGetMinX(caretRect), CGRectGetMidY(caretRect));
++  mEditable.mFloatingCursorLastOffset = caretOffset;
++  mEditable.mCaretMenuActive = NO;
++}
++
++- (void)updateFloatingCursorAtPoint:(CGPoint)aPoint {
++  if (!mEditable.mFloatingCursorActive ||
++      mEditable.mFloatingCursorLastOffset == NSNotFound) {
++    [self beginFloatingCursorAtPoint:aPoint];
++    return;
++  }
++  if (!mGeckoChild || mGeckoChild->Destroyed()) {
++    [self endFloatingCursor];
++    return;
++  }
++
++  CGPoint delta =
++      CGPointMake(aPoint.x - mEditable.mFloatingCursorStartPoint.x,
++                  aPoint.y - mEditable.mFloatingCursorStartPoint.y);
++  CGPoint target =
++      CGPointMake(mEditable.mFloatingCursorStartCaretPoint.x + delta.x,
++                  mEditable.mFloatingCursorStartCaretPoint.y + delta.y);
++
++  LayoutDeviceIntPoint point =
++      UIKitPointsToDevPixels(target, [self contentScaleFactor]);
++  WidgetQueryContentEvent query(true, eQueryCharacterAtPoint, mGeckoChild);
++  query.mRefPoint = point;
++  mGeckoChild->DispatchWindowEvent(query);
++  if (!query.FoundTentativeCaretOffset()) {
++    return;
++  }
++
++  NSUInteger candidateOffset =
++      [self clampOffset:query.mReply->mTentativeCaretOffset.value()];
++  if (candidateOffset == mEditable.mFloatingCursorLastOffset) {
++    return;
++  }
++
++  mEditable.mFloatingCursorLastOffset = candidateOffset;
++  ChildViewTextPosition* position =
++      [ChildViewTextPosition positionWithOffset:candidateOffset];
++  [self setSelectedTextRange:
++            [ChildViewTextRange rangeWithStart:position end:position]];
++}
++
++- (void)endFloatingCursor {
++  mEditable.mFloatingCursorActive = NO;
++  mEditable.mFloatingCursorStartPoint = CGPointZero;
++  mEditable.mFloatingCursorStartCaretPoint = CGPointZero;
++  mEditable.mFloatingCursorLastOffset = NSNotFound;
++  if (mEditable.mSelectionDisplayInteraction != nil) {
++    [self refreshSelectionUI];
++  }
++  [self updateEditMenu];
++}
++
+ - (void)updateInputAssistantItem {
+   Class keyboardClass = NSClassFromString(@"UIKeyboardImpl");
+   MOZ_RELEASE_ASSERT(keyboardClass);
+@@ -2678,8 +2790,19 @@
+ 
+ - (UITextPosition*)closestPositionToPoint:(CGPoint)aPoint
+                               withinRange:(UITextRange*)aRange {
+-  (void)aRange;
+-  return [self closestPositionToPoint:aPoint];
++  ChildViewTextPosition* position =
++      [self textPosForPosition:[self closestPositionToPoint:aPoint]];
++  ChildViewTextRange* range = [self textRangeForTextRange:aRange];
++  if (!position || !range) {
++    return position;
++  }
++
++  NSUInteger start =
++      std::min(range.startPosition.offset, range.endPosition.offset);
++  NSUInteger end =
++      std::max(range.startPosition.offset, range.endPosition.offset);
++  NSUInteger offset = std::max(start, std::min(position.offset, end));
++  return [ChildViewTextPosition positionWithOffset:offset];
+ }
+ 
+ - (UITextRange*)characterRangeAtPoint:(CGPoint)aPoint {
